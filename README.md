@@ -57,7 +57,7 @@ formatmatch/
   template.py                            learn format from a Word template or sample PDF
   refs.py                                reference parsing/styling, in-text citation conversion
   pipeline.py checks.py                  numbering, captions, citations, compliance checks
-  algo.py texblocks.py raw_import.py      algorithm detection, LaTeX block protection, verbatim XML import
+  algo.py texblocks.py raw_import.py texchars.py      algorithm detection, LaTeX block protection, verbatim XML import
   render_docx.py render_latex.py         writers
   engine.py                              high-level API
 tests/make_fixtures.py, tests/run_tests.py
@@ -71,5 +71,6 @@ tests/make_fixtures.py, tests/run_tests.py
   and vector figures need re-inserting (both flagged in the report).
 - MathType objects stay editable in the Word output; in the LaTeX export they are inserted as images.
 - References that cannot be parsed confidently are kept as written and listed in the report.
-- LaTeX output uses the publisher class (IEEEtran, elsarticle, llncs, sn-jnl); if a class is missing locally, copy
-  it from the publisher's template (Overleaf has them all).
+- LaTeX output compiles on Overleaf with the default pdfLaTeX compiler: IEEEtran, elsarticle and llncs are used
+  directly; Springer journals use `article` (Springer's sn-jnl class is not on Overleaf/TeX Live). Unicode symbols
+  (Greek, ≤, ×, superscripts…) are converted to LaTeX commands automatically.
