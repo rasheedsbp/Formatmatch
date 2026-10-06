@@ -13,6 +13,7 @@ By CS Software Solutions — cssoftwaresolutions.in · info@cssoftwaresolutions.
 | Inputs | .docx, .doc/.odt/.rtf (via LibreOffice), .pdf (layout-aware, 1- or 2-column), .tex or .zip LaTeX project with .bib (via pandoc), Markdown |
 | Format sources | Word template/.dotx (styles cloned exactly), published sample PDF (layout measured), guidelines text/file/URL (rule-based or optional Groq AI), journal name (Crossref publisher lookup → house style) |
 | House styles | IEEE journal/conference, Elsevier (numbered/Harvard), Springer Nature (author–year/numbered), Springer LNCS, MDPI, Emerald, Taylor & Francis, Wiley, APA 7, PLOS, Frontiers, generic |
+| Equations & algorithms | Never reflowed: Word equations (OMML), MathType / Equation Editor objects, equation tables, algorithm/pseudocode blocks (plain lines, tables, Word-numbered) and complex tables (merged cells, maths) are copied verbatim with their images, OLE objects, numbering and styles; only fitted to the column width. LaTeX input keeps the original `algorithm`/`equation`/`align` source. PDF input: display equations captured as 300-dpi images, algorithm lines and indentation kept |
 | Structure | Title, authors, affiliations, abstract (inline/block/structured), keywords, headings (1. / 1.1, I. / A. / 1), unnumbered), lists, tables, figures, OMML equations, captions |
 | Citations | Converts author–year ⇄ numbered ⇄ superscript, renumbers by first citation, compresses ranges [2–5], flags unmatched citations and uncited references |
 | References | Parses APA, Harvard, IEEE, Vancouver, Chicago, LNCS, MDPI, Springer, Emerald entries; re-writes in 13 styles; optional Crossref verification (fills DOI/volume/pages) |
@@ -56,6 +57,7 @@ formatmatch/
   template.py                            learn format from a Word template or sample PDF
   refs.py                                reference parsing/styling, in-text citation conversion
   pipeline.py checks.py                  numbering, captions, citations, compliance checks
+  algo.py texblocks.py raw_import.py      algorithm detection, LaTeX block protection, verbatim XML import
   render_docx.py render_latex.py         writers
   engine.py                              high-level API
 tests/make_fixtures.py, tests/run_tests.py
@@ -65,8 +67,9 @@ tests/make_fixtures.py, tests/run_tests.py
 
 - With a Word template, the output is built inside the template itself, so its styles, fonts, spacing, columns,
   headers and footers carry over exactly; the template's sample text is discarded.
-- PDF input recovers text, fonts, raster images and tables; vector figures and equations from PDFs need a manual check
-  (flagged in the report).
+- PDF input recovers text, fonts, raster images and tables; display equations become exact images (not editable)
+  and vector figures need re-inserting (both flagged in the report).
+- MathType objects stay editable in the Word output; in the LaTeX export they are inserted as images.
 - References that cannot be parsed confidently are kept as written and listed in the report.
 - LaTeX output uses the publisher class (IEEEtran, elsarticle, llncs, sn-jnl); if a class is missing locally, copy
   it from the publisher's template (Overleaf has them all).
