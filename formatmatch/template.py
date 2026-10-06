@@ -33,21 +33,65 @@ def _x(el) -> Optional[str]:
     return etree.tostring(el, encoding="unicode") if el is not None else None
 
 
+def _empty_rpr():
+    return etree.Element(qn("w:rPr"))
+
+
 def _dominant_rpr(p_el, skip_label: bool = False):
-    """rPr of the run carrying most text (optionally ignoring the first label run)."""
-    best, best_len, first_rpr = None, -1, None
-    runs = list(p_el.iter(qn("w:r")))
-    for k, r in enumerate(runs):
+    """rPr of the run carrying most text (optionally ignoring the first label run).
+
+    A run without its own rPr yields an *empty* rPr (plain text), never the label's formatting.
+    """
+    best, best_len = None, -1
+    first, seen_first = None, False
+    for r in p_el.iter(qn("w:r")):
         t = "".join(x.text or "" for x in r.iter(qn("w:t")))
         if not t.strip():
             continue
-        if first_rpr is None:
-            first_rpr = r.find(qn("w:rPr"))
-            if skip_label:
+        rpr = r.find(qn("w:rPr"))
+        rpr = rpr if rpr is not None else _empty_rpr()
+        if not seen_first:
+            first, seen_first = rpr, True
+            if skip_label and not re.search(r"[:.—–\-|]\s*\S", t):    # label run (text continues in other runs)
                 continue
         if len(t) > best_len:
-            best, best_len = r.find(qn("w:rPr")), len(t)
-    return (best if best is not None else first_rpr), first_rpr
+            best, best_len = rpr, len(t)
+    return (best if best is not None else first), first
+
+
+_DROP_PPR = ("framePr", "sectPr", "pageBreakBefore", "suppressLineNumbers")
+_DROP_RPR = ("vanish", "specVanish", "webHidden")
+
+
+def sanitize_ppr(xml):
+    """Exemplar paragraph properties without absolute positioning / page breaks / section breaks."""
+    if not xml:
+        return xml
+    el = etree.fromstring(xml)
+    for tag in _DROP_PPR:
+        for x in el.findall(qn("w:" + tag)):
+            el.remove(x)
+    rpr = el.find(qn("w:rPr"))
+    if rpr is not None:
+        el.remove(rpr)
+    return etree.tostring(el, encoding="unicode")
+
+
+def sanitize_rpr(xml):
+    """Exemplar run properties without hidden text, placeholder styling or white text."""
+    if xml is None:
+        return xml
+    el = etree.fromstring(xml)
+    for tag in _DROP_RPR:
+        for x in el.findall(qn("w:" + tag)):
+            el.remove(x)
+    rs = el.find(qn("w:rStyle"))
+    if rs is not None and "placeholder" in (rs.get(qn("w:val")) or "").lower():
+        el.remove(rs)
+    col = el.find(qn("w:color"))
+    if col is not None and (col.get(qn("w:val")) or "").upper() in ("FFFFFF", "AUTO_WHITE"):
+        el.remove(col)
+    return etree.tostring(el, encoding="unicode")
 
 
 def _has_numpr(p_el, doc_styles) -> bool:
@@ -295,8 +339,8 @@ def analyze_docx_template(data: bytes):
                 prof.exemplars["para_first"] = None  # placeholder filled below
                 key2 = "para_first"
                 dom, first = _dominant_rpr(el)
-                prof.exemplars[key2] = {"pPr": _x(el.find(qn("w:pPr"))), "rPr": _x(dom), "label_rPr": None,
-                                        "auto_num": False}
+                prof.exemplars[key2] = {"pPr": sanitize_ppr(_x(el.find(qn("w:pPr")))), "rPr": sanitize_rpr(_x(dom)),
+                                        "label_rPr": None, "auto_num": False}
         elif b.role == M.REFERENCE:
             ref_texts.append(b.orig)
             key = "reference"
@@ -307,14 +351,32 @@ def analyze_docx_template(data: bytes):
             labelled = b.role in (M.ABSTRACT, M.KEYWORDS, M.CAPTION)
             dom, first = _dominant_rpr(el, skip_label=labelled)
             prof.exemplars[key] = {
-                "pPr": _x(el.find(qn("w:pPr"))),
-                "rPr": _x(dom),
-                "label_rPr": _x(first) if labelled else None,
+                "pPr": sanitize_ppr(_x(el.find(qn("w:pPr")))),
+                "rPr": sanitize_rpr(_x(dom)),
+                "label_rPr": sanitize_rpr(_x(first)) if labelled else None,
                 "auto_num": _has_numpr(el, styles),
                 "caps": _caps_in_style(el, dom, styles),
                 "text": b.orig,
             }
         prev = b
+
+    # ---- exemplars must not point at styles that hide text
+    def _hidden_style(sid, depth=0):
+        st = styles.get(sid)
+        if st is None or depth > 8:
+            return False
+        rpr = st.find(qn("w:rPr"))
+        if rpr is not None and rpr.find(qn("w:vanish")) is not None:
+            return True
+        b = st.find(qn("w:basedOn"))
+        return _hidden_style(b.get(qn("w:val")), depth + 1) if b is not None else False
+    for ex in prof.exemplars.values():
+        if ex and ex.get("pPr"):
+            pe = etree.fromstring(ex["pPr"])
+            ps = pe.find(qn("w:pStyle"))
+            if ps is not None and _hidden_style(ps.get(qn("w:val"))):
+                pe.remove(ps)
+                ex["pPr"] = etree.tostring(pe, encoding="unicode")
 
     # ---- derive spec overrides
     pe = prof.exemplars.get("para") or prof.exemplars.get("para_short")
@@ -350,9 +412,18 @@ def analyze_docx_template(data: bytes):
             ts = heading_texts.get(lvl)
             ex = prof.exemplars.get(f"h{lvl}", {})
             if ts:
-                bare = strip_heading_number(ts[0])[1]
-                case = "as-is" if ex.get("caps") else text_case(bare)
-                levels.append({"case": case if case != "sentence" or len(bare.split()) > 1 else "as-is"})
+                cases = []
+                for t in ts:
+                    bare = strip_heading_number(t)[1]
+                    c = text_case(bare)
+                    if len(bare.split()) == 1 and bare[:1].isupper() and c != "upper":
+                        c = "title-1"            # one capitalised word: title or sentence case
+                    cases.append(c)
+                multi = [c for c in cases if c not in ("title-1",)]
+                case = collections.Counter(multi).most_common(1)[0][0] if multi else "title"
+                if ex.get("caps"):
+                    case = "as-is"              # style itself applies (small) caps
+                levels.append({"case": case})
             else:
                 levels.append({})
         ov["headings"]["levels"] = levels

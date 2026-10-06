@@ -178,7 +178,9 @@ PRESETS = {
         "references": {"style": "springer-basic", "size": 10},
         "citations": {"mode": "author-year-nocomma"},
         "body_xref": {"figure": "Fig.", "table": "Table"},
-        "latex": {"class": "sn-jnl", "options": "pdflatex,sn-basic", "bibstyle": "sn-basic"},
+        "latex": {"class": "article", "options": "11pt,a4paper", "bibstyle": "spbasic",
+                  "note": "Springer's sn-jnl class is not installed on Overleaf by default; this export uses article "
+                          "with Springer layout. To switch, add sn-jnl.cls from the Springer Nature LaTeX template."},
         "limits": {"abstract_words": 250, "keywords_min": 4, "keywords_max": 6},
     },
     "springer_numeric": {
@@ -186,7 +188,7 @@ PRESETS = {
         "_base": "springer_journal",
         "references": {"style": "springer-vancouver"},
         "citations": {"mode": "numeric"},
-        "latex": {"options": "pdflatex,sn-mathphys-num", "bibstyle": "sn-mathphys-num"},
+        "latex": {"bibstyle": "spmpsci"},
     },
     "springer_lncs": {
         "name": "Springer LNCS / conference proceedings",

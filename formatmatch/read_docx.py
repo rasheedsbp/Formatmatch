@@ -400,6 +400,23 @@ class DocxReader:
             return "algo_tbl"
         rows = el.findall(qn("w:tr"))
         cells = [tc for tr in rows for tc in tr.findall(qn("w:tc"))]
+        # figure layout table: pictures + their caption / sub-figure labels → unwrap
+        if not has_math(el) and (next(el.iter(qn("w:drawing")), None) is not None or
+                                 next(el.iter(f"{{{NS_V}}}imagedata"), None) is not None):
+            from .classify import is_caption_text
+            pic_cells = text_cells = 0
+            long_text = False
+            for tc in cells:
+                has_pic = next(tc.iter(qn("w:drawing")), None) is not None or \
+                    next(tc.iter(f"{{{NS_V}}}imagedata"), None) is not None
+                t = re.sub(r"\s+", " ", "".join(x.text or "" for x in tc.iter(qn("w:t")))).strip()
+                if has_pic:
+                    pic_cells += 1
+                elif t and not is_caption_text(t):
+                    text_cells += 1
+                    long_text = long_text or len(t) > 80
+            if pic_cells and text_cells <= pic_cells and not long_text:
+                return "layout"
         # equation table: maths + only numbers / operators as text
         if has_math(el) or any(r.img and r.img.get("kind") == "ole-eq" for p in paras for r in self._runs(p, False)):
             ok = True

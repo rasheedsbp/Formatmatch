@@ -17,34 +17,13 @@ from .refs import _expand
 
 NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-UNI = {
-    "“": "``", "”": "''", "‘": "`", "’": "'", "–": "--", "—": "---", "…": "\\ldots{}", "\u00a0": "~",
-    "¹": "\\textsuperscript{1}", "²": "\\textsuperscript{2}", "³": "\\textsuperscript{3}",
-    "⁴": "\\textsuperscript{4}", "⁵": "\\textsuperscript{5}", "⁶": "\\textsuperscript{6}",
-    "±": "$\\pm$", "×": "$\\times$", "≤": "$\\leq$", "≥": "$\\geq$", "≈": "$\\approx$", "→": "$\\rightarrow$",
-    "←": "$\\leftarrow$", "∼": "$\\sim$", "°": "$^\\circ$", "µ": "$\\mu$", "−": "$-$", "·": "$\\cdot$",
-    "α": "$\\alpha$", "β": "$\\beta$", "γ": "$\\gamma$", "δ": "$\\delta$", "ε": "$\\epsilon$", "θ": "$\\theta$",
-    "λ": "$\\lambda$", "μ": "$\\mu$", "π": "$\\pi$", "σ": "$\\sigma$", "τ": "$\\tau$", "φ": "$\\phi$",
-    "ω": "$\\omega$", "Δ": "$\\Delta$", "Σ": "$\\Sigma$", "Ω": "$\\Omega$", "∈": "$\\in$", "∑": "$\\sum$",
-    "√": "$\\surd$", "∞": "$\\infty$", "•": "\\textbullet{}", "§": "\\S{}", "©": "\\textcopyright{}",
-    "€": "\\texteuro{}", "₹": "Rs.", "™": "\\texttrademark{}", "®": "\\textregistered{}",
-}
-SPECIAL = {"\\": "\\textbackslash{}", "&": "\\&", "%": "\\%", "$": "\\$", "#": "\\#", "_": "\\_",
-           "{": "\\{", "}": "\\}", "~": "\\textasciitilde{}", "^": "\\textasciicircum{}"}
+from .texchars import tex_math, tex_text
+
+_UNKNOWN: set = set()
 
 
 def esc(s: str) -> str:
-    out = []
-    for ch in s:
-        if ch in SPECIAL:
-            out.append(SPECIAL[ch])
-        elif ch in UNI:
-            out.append(UNI[ch])
-        elif ch == "\t":
-            out.append(" ")
-        else:
-            out.append(ch)
-    return "".join(out)
+    return tex_text(s, _UNKNOWN)
 
 
 # ------------------------------------------------------------------ OMML → LaTeX (batched through pandoc)
@@ -152,10 +131,19 @@ class LatexRenderer:
         lx = r.latex or self.math.get(self.math_ids.get(id(r), -1))
         if not lx:
             return "\\square" if in_math else "\\(\\square\\)"
+        lx = tex_math(lx, _UNKNOWN)
         return lx if in_math else f"\\({lx}\\)"
 
     # ---------------------------------------------------------- inline text
-    def runs(self, runs: List[Run]) -> str:
+    def runs(self, runs: List[Run], plain: bool = False) -> str:
+        """plain=True: drop bold/italic that covers the whole text (titles, headings — the class styles them)."""
+        if plain:
+            txt = [r for r in runs if not r.is_math and r.text.strip()]
+            ub = bool(txt) and all(r.bold for r in txt)
+            ui = bool(txt) and all(r.italic for r in txt)
+            if ub or ui:
+                runs = [Run(r.text, r.bold and not ub, r.italic and not ui, r.sup, r.sub, r.omml, r.latex, r.cite,
+                            r.raw, r.img) for r in runs]
         out = []
         for r in runs:
             if r.is_math:
@@ -243,9 +231,66 @@ class LatexRenderer:
         L.append("\\begin{document}")
         return "\n".join(L)
 
+    # ---------------------------------------------------------- authors & affiliations with markers
+    _SUPD = {"¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9", "⁰": "0"}
+
+    def _marked_text(self, runs):
+        """Plain text where superscript markers are wrapped as ⟦…⟧."""
+        out = ""
+        for r in runs:
+            if r.is_math:
+                continue
+            t = r.text
+            if r.sup and t.strip():
+                out += "⟦" + t.strip() + "⟧"
+            else:
+                out += re.sub(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+", lambda m: "⟦" + "".join(self._SUPD[c] for c in m.group(0)) + "⟧", t)
+        return out
+
+    def parse_authors(self, author_blocks):
+        """[(name, [labels], corresponding)]"""
+        res = []
+        for b in author_blocks:
+            t = self._marked_text(b.runs)
+            t = re.sub(r"\s+and\s+|\s*&\s*|;", ",", t)
+            for part in [x.strip(" ,") for x in t.split(",")]:
+                if not part:
+                    continue
+                labels = []
+                corr = False
+                for m in re.finditer(r"⟦([^⟧]*)⟧", part):
+                    for lab in re.split(r"[,\s]+", m.group(1)):
+                        if lab in ("*", "†", "✉"):
+                            corr = True
+                        elif lab:
+                            labels.append(lab.strip("*†"))
+                            corr = corr or "*" in lab
+                name = re.sub(r"⟦[^⟧]*⟧", "", part)
+                if "*" in name or "†" in name:
+                    corr = True
+                name = name.replace("*", "").replace("†", "").strip()
+                if re.fullmatch(r"[\d\s]+", name) and res:          # "Name 1" split oddly
+                    res[-1][1].append(name.strip())
+                    continue
+                if name:
+                    res.append((name, labels, corr))
+        return res
+
+    def parse_affils(self, affil_blocks):
+        """[(label or None, text)]"""
+        out = []
+        for b in affil_blocks:
+            t = self._marked_text(b.runs).strip()
+            m = re.match(r"^⟦([^⟧]+)⟧\s*(.*)$", t) or re.match(r"^(\d{1,2})[\s.)]+(\D.*)$", t)
+            if m:
+                out.append((m.group(1).strip(), m.group(2).strip()))
+            else:
+                out.append((None, t))
+        return out
+
     def front_matter(self, front: dict) -> str:
         cls = self.cls
-        T = self.runs(front["title"].runs) if front.get("title") else "Title"
+        T = self.runs(front["title"].runs, plain=True) if front.get("title") else "Title"
         authors = [self.runs(b.runs) for b in front.get("authors", [])]
         affils = [self.runs(b.runs) for b in front.get("affils", [])]
         abstract = front.get("abstract", [])
@@ -265,12 +310,26 @@ class LatexRenderer:
         elif cls == "elsarticle":
             L.append("\\begin{frontmatter}")
             L.append(f"\\title{{{T}}}")
-            for a in authors:
-                for name in re.split(r",\s*(?:and\s+)?|\s+and\s+", a):
-                    if name.strip():
-                        L.append(f"\\author{{{name.strip()}}}")
-            for a in affils:
-                L.append(f"\\affiliation{{organization={{{a}}}}}")
+            people = self.parse_authors(front.get("authors", []))
+            places = self.parse_affils(front.get("affils", []))
+            labelled = any(lab for lab, _ in places)
+            corr_done = False
+            for name, labs, corr in people:
+                opt = f"[{','.join(labs)}]" if (labs and labelled) else ""
+                cor = ""
+                if corr and not corr_done:
+                    cor, corr_done = "\\corref{cor1}", True
+                L.append(f"\\author{opt}{{{esc(name)}{cor}}}")
+            if corr_done:
+                L.append("\\cortext[cor1]{Corresponding author}")
+            for lab, text in places:
+                text = re.sub(r"[;,]?\s*\*?\s*(?:corresponding author|e-?mail)\s*:?.*$", "", text, flags=re.I).strip(" ;,")
+                emails = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", self._marked_text([Run(x.text) for b in front.get("affils", []) for x in b.runs]))
+                text = re.sub(r"[;,]?\s*[\w.+-]+@[\w-]+\.[\w.-]+", "", text).strip(" ;,")
+                opt = f"[{lab}]" if (lab and labelled) else ""
+                L.append(f"\\affiliation{opt}{{organization={{{esc(text)}}}}}")
+            for e in dict.fromkeys(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", " ".join(b.text for b in front.get("affils", [])))):
+                L.append(f"\\ead{{{esc(e)}}}")
             if abs_tex:
                 L.append(f"\\begin{{abstract}}\n{abs_tex}\n\\end{{abstract}}")
             if kw_list:
@@ -280,8 +339,15 @@ class LatexRenderer:
                 L.append("\\linenumbers")
         elif cls == "llncs":
             L.append(f"\\title{{{T}}}")
-            L.append("\\author{" + " \\and ".join(authors) + "}")
-            L.append("\\institute{" + " \\\\ ".join(affils) + "}")
+            people = self.parse_authors(front.get("authors", []))
+            places = self.parse_affils(front.get("affils", []))
+            order = [lab for lab, _ in places if lab]
+            def inst(labs):
+                nums = [str(order.index(l) + 1) for l in labs if l in order]
+                return f"\\inst{{{','.join(nums)}}}" if nums else ""
+            L.append("\\author{" + " \\and ".join(esc(n) + inst(l) for n, l, _ in people) + "}" if people
+                     else "\\author{" + " \\and ".join(authors) + "}")
+            L.append("\\institute{" + " \\and ".join(esc(t) for _, t in places) + "}")
             L.append("\\maketitle")
             if abs_tex:
                 L.append("\\begin{abstract}\n" + abs_tex + "\n" +
@@ -332,7 +398,7 @@ class LatexRenderer:
                     continue
                 cmd = cmds[min(b.level, 4) - 1]
                 star = "*" if (not b.prefix and (known_section(b.text) in UNNUMBERED or self.spec["headings"]["scheme"] == "none")) else ""
-                txt = self.runs(b.runs)
+                txt = self.runs(b.runs, plain=True)
                 if self.cls == "IEEEtran" and b.level == 1:
                     txt = txt.title() if txt.isupper() else txt
                 L.append(f"\n\\{cmd}{star}{{{txt}}}")
@@ -383,7 +449,7 @@ class LatexRenderer:
         figs = [x for x in grp if x.role == M.FIGURE]
         tabs = [x for x in grp if x.role == M.TABLE]
         out = []
-        cap_tex = self.runs(cap.runs) if cap else ""
+        cap_tex = self.runs(cap.runs, plain=True) if cap else ""
         if figs:
             out.append("\\begin{figure}[!t]\n\\centering")
             w = 1.0 / len(figs) - 0.02 if len(figs) > 1 else 1.0
@@ -569,8 +635,13 @@ class LatexRenderer:
             "and keep the \\cite{rN} keys.\n\n"
             "If the class file (e.g. IEEEtran.cls, elsarticle.cls, llncs.cls, sn-jnl.cls) is not installed, download\n"
             "the publisher's LaTeX template and copy its .cls/.bst files into this folder.\n"
+            + (("\nNote: " + self.spec["latex"]["note"] + "\n") if self.spec["latex"].get("note") else "")
         )
         self.files["README.txt"] = readme.encode()
+        if _UNKNOWN:
+            self.warnings.append("LaTeX: characters without a pdfLaTeX equivalent were replaced by '?': "
+                                 + " ".join(sorted(_UNKNOWN)))
+            _UNKNOWN.clear()
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for name, data in self.files.items():

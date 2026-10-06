@@ -80,6 +80,16 @@ def merge_adjacent(runs: List[Run]) -> List[Run]:
     return out
 
 
+def _cap(w: str) -> str:
+    """Capitalise a word's first *Latin* letter only (keeps α-, β-, 3D, iPhone …)."""
+    if not w:
+        return w
+    c = w[0]
+    if c.isascii() or "\u00c0" <= c <= "\u024f":
+        return c.upper() + w[1:]
+    return w
+
+
 def apply_case(text: str, case: str) -> str:
     if case in ("title", "sentence") and text.isupper() and len(text) > 4:
         text = text.lower()   # all-caps source heading: no acronym info to preserve
@@ -96,7 +106,7 @@ def apply_case(text: str, case: str) -> str:
             elif i > 0 and w.lower() in small:
                 out.append(w.lower())
             else:
-                out.append(w[:1].upper() + w[1:].lower() if not any(c.isupper() for c in w[1:]) else w[:1].upper() + w[1:])
+                out.append(_cap(w[:1] + w[1:].lower()) if not any(c.isupper() for c in w[1:]) else _cap(w))
         return " ".join(out)
     if case == "sentence":
         words = text.split(" ")
@@ -105,7 +115,7 @@ def apply_case(text: str, case: str) -> str:
             if (w.isupper() and len(w) > 1) or any(c.isupper() for c in w[1:]):
                 out.append(w)                         # keep acronyms / CamelCase
             elif i == 0:
-                out.append(w[:1].upper() + w[1:].lower())
+                out.append(_cap(w[:1] + w[1:].lower()))
             else:
                 out.append(w.lower())
         return " ".join(out)

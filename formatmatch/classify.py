@@ -46,6 +46,44 @@ CAPTION_RE = re.compile(
     r"^\s*(?P<kind>fig\.?|figure|table|tab\.)\s*(?P<num>\d+|[IVXLC]+)\s*(?P<sep>[\.:\-–—|]\s*)?(?P<rest>.*)$",
     re.I | re.S,
 )
+CAPTION_VERBS = {
+    "shows", "show", "illustrates", "presents", "depicts", "depict", "demonstrates", "compares", "summarizes",
+    "summarises", "lists", "gives", "reports", "displays", "indicates", "contains", "provides", "describes",
+    "reveals", "plots", "highlights", "outlines", "is", "are", "was", "were", "and", "also", "in", "of", "confirms",
+    "represents", "exhibits", "details", "clearly", "further", "below", "above", "visualizes", "visualises",
+    "tabulates", "explains", "suggests", "has", "have", "can", "will", "we", "it", "the", "a", "an", "to",
+}
+ARTICLE_TYPE_RE = re.compile(
+    r"^\s*(?:(?:original|research|review|short|brief|technical|case|mini|systematic|full[- ]length|regular|"
+    r"invited|perspective|empirical|conceptual|methodological)\s+)*(?:research\s+)?(?:article|paper|communication|"
+    r"report|note|review|letter|study|manuscript)s?\s*$|"
+    r"^\s*(?:running\s+(?:head|title)|short\s+title|article\s+type|manuscript\s+(?:type|id|no|number)|"
+    r"paper\s+type|received|accepted|published|available\s+online|doi|issn|e-?issn|vol\.|volume)\b",
+    re.I,
+)
+TITLE_PREFIX_RE = re.compile(r"^\s*(?:paper\s+|article\s+|manuscript\s+)?title\s*[:\-–—]\s*(?P<rest>\S.*)$", re.I | re.S)
+
+
+def is_caption_text(t: str, style: str = "") -> bool:
+    """Is a paragraph a figure/table caption (and not a sentence that merely starts with 'Figure 2 shows…')?"""
+    cm = CAPTION_RE.match(t)
+    if not cm or len(t) > 600:
+        return False
+    if (style or "").lower().startswith("caption"):
+        return True
+    rest = cm.group("rest").strip()
+    first = re.match(r"[A-Za-z]+", rest)
+    first_word = first.group(0).lower() if first else ""
+    if not rest:
+        return len(t) < 24                                  # "Table 1" alone: text follows on the next line
+    if cm.group("sep"):
+        return first_word not in CAPTION_VERBS or rest[:1].isupper()
+    if cm.group("kind").isupper() and len(cm.group("kind")) > 2:
+        return True                                         # "TABLE 2 HYPER-PARAMETERS"
+    # no separator: "Fig 2 Training loss …" → caption ; "Figure 2 shows …" → sentence
+    return (rest[:1].isupper() or rest[:1] in "(“\"'") and first_word not in CAPTION_VERBS
+
+
 ABSTRACT_RE = re.compile(r"^\s*abstract\s*(?:[:\-–—.]\s*)?(?P<rest>.*)$", re.I | re.S)
 KEYWORDS_RE = re.compile(r"^\s*(?:key\s*-?\s*words?|index\s+terms)\s*(?:[:\-–—.]\s*)?(?P<rest>.*)$", re.I | re.S)
 STRUCT_ABS_RE = re.compile(
@@ -178,9 +216,8 @@ class RoleClassifier:
 
         # captions are recognisable anywhere
         cm = CAPTION_RE.match(t)
-        if cm and (style.startswith("caption") or len(t) < 400) and self.state != "refs":
-            if style.startswith("caption") or (cm.group("sep") and cm.group("rest")) or (cm.group("kind")[0].isupper() and cm.group("kind").isupper()):
-                return M.CAPTION, 0, cm.group("kind").lower(), None
+        if cm and self.state not in ("refs", "front") and is_caption_text(t, style):
+            return M.CAPTION, 0, cm.group("kind").lower(), None
 
         # explicit styles (Word templates / pandoc output)
         if style == "bibliography":
@@ -247,6 +284,16 @@ class RoleClassifier:
                 self.state = "body"
                 return M.HEADING, lvl, "", None
             if not self.seen_title:
+                tm = TITLE_PREFIX_RE.match(t)
+                if tm:
+                    self.seen_title = True
+                    return M.TITLE, 0, "", tm.group("rest").strip()
+                # labels above the title: "Original Research Article", "Running head: …", journal banner lines
+                if ARTICLE_TYPE_RE.match(t) and not p.is_title_style and style != "title":
+                    return M.OTHER_FRONT, 0, "", None
+                if (self.max_size >= self.body_size + 3 and p.size < self.max_size - 1.5 and len(t.split()) <= 6
+                        and not p.is_title_style and style != "title"):
+                    return M.OTHER_FRONT, 0, "", None
                 if p.is_title_style or style == "title" or (
                     len(t) < 300 and (p.size >= max(self.body_size + 2, self.max_size - 0.5) or p.bold or self.count <= 2)
                 ):

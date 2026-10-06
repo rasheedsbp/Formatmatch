@@ -234,7 +234,7 @@ class DocxRenderer:
             return None
         for k in keys:
             e = self.prof.exemplars.get(k)
-            if e and e.get("pPr") is not None or (e and e.get("rPr")):
+            if e is not None:
                 return e
         return None
 

@@ -187,6 +187,8 @@ def _number_headings(blocks: List[M.Block], spec, rep: Report):
         ks = known_section(bare)
         levels = hs.get("levels", [])
         case = levels[lvl - 1].get("case", "as-is") if lvl - 1 < len(levels) else "as-is"
+        if case == "as-is" and bare.isupper() and len(bare) > 4 and not levels[lvl - 1].get("smallcaps"):
+            case = "title"          # ALL-CAPS source headings → normal case (the journal style adds caps if needed)
         if case != "as-is":
             b.runs = [Run(apply_case(bare, case))]
         if ks in UNNUMBERED or bare.lower().startswith("appendix"):
@@ -348,9 +350,27 @@ def _ensure_ref_heading(blocks, spec):
 
 
 # ------------------------------------------------------------------ entry
+def _join_label_captions(blocks: List[M.Block]) -> List[M.Block]:
+    """'Table 1' on one line and its title on the next → one caption."""
+    out = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b.role == M.CAPTION and not b.text.strip() and i + 1 < len(blocks) and \
+                blocks[i + 1].role in (M.PARA, M.HEADING, M.OTHER_FRONT) and 0 < len(blocks[i + 1].text) < 300:
+            b.runs = list(blocks[i + 1].runs)
+            out.append(b)
+            i += 2
+            continue
+        out.append(b)
+        i += 1
+    return out
+
+
 def prepare(doc: M.Document, spec: dict, crossref: bool = False, progress=None) -> Tuple[M.Document, Report]:
     rep = Report()
     blocks = [copy.copy(b) for b in doc.blocks if b.role != M.ABSTRACT_HEADING]
+    blocks = _join_label_captions(blocks)
     for w in doc.warnings:
         rep.warn(w)
     blocks = _pair_floats(blocks, spec, rep)
