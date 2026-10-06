@@ -17,6 +17,7 @@ from lxml import etree
 
 from . import model as M
 from .model import Run
+from .raw_import import RawImporter, fit_equation_tabs, fit_table
 
 ALIGN = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
          "right": WD_ALIGN_PARAGRAPH.RIGHT, "justify": WD_ALIGN_PARAGRAPH.JUSTIFY}
@@ -27,6 +28,37 @@ NS_M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 TBLPR_ORDER = ["tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize", "tblStyleColBandSize",
                "tblW", "jc", "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook",
                "tblCaption", "tblDescription"]
+
+
+PPR_ORDER = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr",
+             "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap",
+             "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
+             "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection",
+             "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange"]
+MATH_PR_ORDER = {
+    "dPr": ["begChr", "sepChr", "endChr", "grow", "shp", "ctrlPr"],
+    "mcPr": ["count", "mcJc"],
+    "mPr": ["baseJc", "plcHide", "rSpRule", "cGpRule", "rSp", "cSp", "cGp", "mcs", "ctrlPr"],
+    "eqArrPr": ["baseJc", "maxDist", "objDist", "rSpRule", "rSp", "ctrlPr"],
+    "naryPr": ["chr", "limLoc", "grow", "subHide", "supHide", "ctrlPr"],
+    "fPr": ["type", "ctrlPr"],
+}
+
+
+def _fix_math_order(root):
+    """pandoc writes m:dPr children out of schema order; Word is lenient but validators are not."""
+    for t in root.iter(f"{{{NS_M}}}t"):
+        if t.text and "\u200b" in t.text:
+            t.text = t.text.replace("\u200b", "")
+    for tag, order in MATH_PR_ORDER.items():
+        for pr in root.iter(f"{{{NS_M}}}{tag}"):
+            kids = list(pr)
+            key = lambda e: order.index(etree.QName(e).localname) if etree.QName(e).localname in order else 99
+            if [key(k) for k in kids] != sorted(key(k) for k in kids):
+                for k in kids:
+                    pr.remove(k)
+                for k in sorted(kids, key=key):
+                    pr.append(k)
 
 
 def _put(parent, child, order):
@@ -58,6 +90,7 @@ class DocxRenderer:
         self.spec = spec
         self.prof = profile
         self.warnings: List[str] = []
+        self.imp: Optional[RawImporter] = None
 
     # ------------------------------------------------------------ setup
     def _new_document(self):
@@ -302,7 +335,31 @@ class DocxRenderer:
                 i = True if r.italic else i
             self._run(p, r.text, base_rpr, size=size, bold=b, italic=i, sup=r.sup, sub=r.sub, smallcaps=smallcaps)
 
+    def _insert(self, el):
+        body = self.d.element.body
+        sp = body.find(qn("w:sectPr"))
+        if sp is not None:
+            sp.addprevious(el)
+        else:
+            body.append(el)
+        return el
+
     def _math(self, p, r: Run, inline=True):
+        if r.raw is None and r.img is not None and r.omml is None and r.latex is None:
+            try:
+                p.add_run().add_picture(io.BytesIO(r.img["blob"]), height=Inches(r.img.get("h") or 0.2))
+            except Exception:
+                self._run(p, "[equation]", italic=True)
+            return
+        if r.raw is not None:
+            if self.imp is not None:
+                p._p.append(self.imp.prepare(r.raw))
+            elif r.img and r.img.get("blob"):
+                try:
+                    p.add_run().add_picture(io.BytesIO(r.img["blob"]), height=Inches(r.img.get("h") or 0.2))
+                except Exception:
+                    self._run(p, "[equation]", italic=True)
+            return
         if r.omml:
             el = parse_xml(r.omml)
             if etree.QName(el).localname == "oMathPara" and inline:
@@ -471,6 +528,16 @@ class DocxRenderer:
 
     def _table(self, b: M.Block):
         T = self.spec["tables"]
+        if b.raw and self.imp is not None:
+            # complex table (maths, merged cells, images): keep it exactly, only fit it to the column
+            for el in b.raw:
+                new = self.imp.prepare(el)
+                fit_table(new, self._col_width_cm())
+                self._insert(new)
+            sp = self.d.add_paragraph()
+            sp.paragraph_format.space_after = Pt(2)
+            sp.paragraph_format.line_spacing = 0.6
+            return
         rows = b.rows or [[""]]
         ncol = max(len(r) for r in rows)
         t = self.d.add_table(rows=len(rows), cols=ncol)
@@ -495,7 +562,12 @@ class DocxRenderer:
                 cp.paragraph_format.space_after = Pt(1)
                 cp.paragraph_format.line_spacing = 1.0
                 cp.alignment = WD_ALIGN_PARAGRAPH.CENTER if (i == 0 or re.fullmatch(r"[\d.,%±\-–+()\s]+", txt or "x")) else WD_ALIGN_PARAGRAPH.LEFT
-                self._run(cp, txt, size=T.get("size"), bold=(i == 0 and T.get("header_bold", True)) or None)
+                cell_runs = b.rows_runs[i][j] if (b.rows_runs and i < len(b.rows_runs) and j < len(b.rows_runs[i])) else None
+                if cell_runs and any(r.is_math for r in cell_runs):
+                    self._runs(cp, cell_runs, size=T.get("size"), bold=(i == 0 and T.get("header_bold", True)) or None,
+                               honor_all=True)
+                else:
+                    self._run(cp, txt, size=T.get("size"), bold=(i == 0 and T.get("header_bold", True)) or None)
         if T.get("borders", "booktabs") == "booktabs" and not (self.prof and self.prof.table_tblPr):
             for c in t.rows[0].cells:
                 tcPr = c._tc.get_or_add_tcPr()
@@ -524,10 +596,33 @@ class DocxRenderer:
         _put(tblPr, bd, TBLPR_ORDER)
 
     def _equation(self, b: M.Block):
+        if b.raw and self.imp is not None:
+            for el in b.raw:
+                new = self.imp.prepare(el)
+                if etree.QName(new).localname == "tbl":
+                    fit_table(new, self._col_width_cm())
+                    for tc in new.iter(qn("w:tc")):           # number aligned with the equation
+                        tcpr = tc.find(qn("w:tcPr"))
+                        if tcpr is None:
+                            tcpr = OxmlElement("w:tcPr"); tc.insert(0, tcpr)
+                        for old in tcpr.findall(qn("w:vAlign")):
+                            tcpr.remove(old)
+                        va = OxmlElement("w:vAlign"); va.set(qn("w:val"), "center")
+                        tcpr.append(va)
+                else:
+                    fit_equation_tabs(new, self._col_width_cm())
+                self._insert(new)
+            return
         ex = self._ex("equation")
         p = self._para(ex)
         if not ex:
             self._fmt(p, align="left" if b.eq_num else "center", indent_first=0, before=4, after=4, line=1.0)
+        if b.image and not b.runs:
+            # equation captured from a PDF as a picture: keep its exact size (shrink only if wider than the column)
+            col_in = self._col_width_cm() / 2.54 * (0.82 if b.eq_num else 1.0)
+            w = min(b.width_in or col_in, col_in)
+            pic_run = Run(img={"blob": b.image, "ext": b.image_ext, "h": (b.height_in or 0.3) * w / (b.width_in or w)})
+            b = M.Block(M.EQUATION, runs=[pic_run], eq_num=b.eq_num)
         if b.eq_num:
             w = self._col_width_cm()
             ind = p.paragraph_format.left_indent.cm if p.paragraph_format.left_indent else 0
@@ -539,10 +634,75 @@ class DocxRenderer:
             for r in b.runs:
                 self._math(p, r, inline=True)
             p.add_run().add_tab()
-            self._run(p, f"({b.eq_num})")
+            nr = self._run(p, f"({b.eq_num})")
+            pics = [r for r in b.runs if r.img is not None and r.raw is None and r.omml is None]
+            if pics and nr is not None:
+                h_pt = max((r.img.get("h") or 0.2) for r in pics) * 72
+                rpr = nr._r.get_or_add_rPr()
+                pos = OxmlElement("w:position")
+                pos.set(qn("w:val"), str(int(max(0, h_pt / 2 - 3) * 2)))
+                rpr.append(pos)
         else:
             for r in b.runs:
                 self._math(p, r, inline=False)
+
+    def _algorithm(self, b: M.Block):
+        if b.raw and self.imp is not None:
+            news = [self.imp.prepare(el) for el in b.raw]
+            paras = [n for n in news if etree.QName(n).localname == "p"]
+            for n in news:
+                if etree.QName(n).localname == "tbl":
+                    fit_table(n, self._col_width_cm())
+                self._insert(n)
+            if etree.QName(news[-1]).localname == "tbl":
+                sp = self.d.add_paragraph()
+                sp.paragraph_format.space_after = Pt(4)
+                sp.paragraph_format.line_spacing = 0.6
+            if 1 < len(paras) <= 45:                      # keep the algorithm on one page/column
+                for pe in paras[:-1]:
+                    ppr = pe.find(qn("w:pPr"))
+                    if ppr is None:
+                        ppr = OxmlElement("w:pPr"); pe.insert(0, ppr)
+                    if ppr.find(qn("w:keepNext")) is None:
+                        kn = OxmlElement("w:keepNext")
+                        anchor = ppr.find(qn("w:pStyle"))
+                        if anchor is not None:
+                            anchor.addnext(kn)
+                        else:
+                            ppr.insert(0, kn)
+            return
+        # rebuilt (PDF / LaTeX sources): ruled algorithm box
+        F = self.spec["font"]
+        size = max(7.0, F["size"] - 1)
+
+        def rule(p, edge):
+            ppr = p._p.get_or_add_pPr()
+            bdr = ppr.find(qn("w:pBdr"))
+            if bdr is None:
+                bdr = OxmlElement("w:pBdr")
+                _put(ppr, bdr, PPR_ORDER)
+            e = OxmlElement(f"w:{edge}")
+            e.set(qn("w:val"), "single"); e.set(qn("w:sz"), "8"); e.set(qn("w:space"), "1"); e.set(qn("w:color"), "000000")
+            bdr.append(e)
+
+        head = self.d.add_paragraph()
+        self._fmt(head, align="left", indent_first=0, before=6, after=2, line=1.0, keep_next=True)
+        if b.runs:
+            self._runs(head, b.runs, size=size, honor_all=True)
+        else:
+            self._run(head, b.orig or "Algorithm", size=size, bold=True)
+        rule(head, "top"); rule(head, "bottom")
+        n = len(b.lines or [])
+        for k, (lvl, runs) in enumerate(b.lines or []):
+            p = self.d.add_paragraph()
+            self._fmt(p, align="left", indent_first=0, before=0, after=0, line=1.0, keep_next=k < n - 1 and n <= 45,
+                      left=0.2 + 0.5 * float(lvl))
+            self._runs(p, runs, size=size, honor_all=True)
+            if k == n - 1:
+                rule(p, "bottom")
+        sp = self.d.add_paragraph()
+        sp.paragraph_format.space_after = Pt(4)
+        sp.paragraph_format.line_spacing = 0.6
 
     def _reference(self, b: M.Block):
         R = self.spec["references"]
@@ -564,6 +724,8 @@ class DocxRenderer:
     # ------------------------------------------------------------ main
     def render(self, doc: M.Document) -> bytes:
         self.d = self._new_document()
+        if doc.src_docx is not None:
+            self.imp = RawImporter(doc.src_docx, self.d)
         S = self.spec
         blocks = doc.blocks
         front_roles = {M.TITLE, M.AUTHOR, M.AFFIL, M.OTHER_FRONT, M.ABSTRACT, M.KEYWORDS}
@@ -607,12 +769,15 @@ class DocxRenderer:
                 self._table(b)
             elif r == M.EQUATION:
                 self._equation(b)
+            elif r == M.ALGORITHM:
+                self._algorithm(b)
             elif r == M.REFERENCE:
                 self._reference(b)
             prev_role = r
             i += 1
         if body_start >= len(blocks):
             pass
+        _fix_math_order(self.d.element.body)
         zoom = self.d.settings.element.find(qn("w:zoom"))
         if zoom is not None and zoom.get(qn("w:percent")) is None:
             zoom.set(qn("w:percent"), "100")

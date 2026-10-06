@@ -255,10 +255,11 @@ def _abstract(blocks, spec, rep: Report):
 
 
 def _equations(blocks, rep):
-    eqs = [b for b in blocks if b.role == M.EQUATION]
-    if any(b.eq_num for b in eqs):
-        for i, b in enumerate(eqs, 1):
-            b.eq_num = str(i)
+    """Equations and algorithms are carried over verbatim (numbers, layout, MathType objects untouched)."""
+    n_eq = sum(1 for b in blocks if b.role == M.EQUATION)
+    n_alg = sum(1 for b in blocks if b.role == M.ALGORITHM)
+    if n_eq or n_alg:
+        rep.change(f"{n_eq} display equation(s) and {n_alg} algorithm(s) preserved exactly as in the source")
 
 
 # ------------------------------------------------------------------ references
@@ -364,7 +365,8 @@ def prepare(doc: M.Document, spec: dict, crossref: bool = False, progress=None) 
     _equations(blocks, rep)
     for b in blocks:
         b.runs = merge_adjacent(b.runs)
-    out = M.Document(blocks=blocks, source_type=doc.source_type, warnings=[])
+    out = M.Document(blocks=blocks, source_type=doc.source_type, warnings=[], src_docx=doc.src_docx,
+                     tex_preamble=list(doc.tex_preamble))
     from .checks import run_checks
     run_checks(out, spec, rep)
     return out, rep

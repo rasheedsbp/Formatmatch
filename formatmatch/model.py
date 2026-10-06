@@ -20,6 +20,7 @@ EQUATION = "equation"
 REFERENCE = "reference"
 OTHER_FRONT = "front"  # correspondence, dates, etc.
 ABSTRACT_HEADING = "abstract_heading"  # standalone "Abstract" label line
+ALGORITHM = "algorithm"
 
 
 @dataclass
@@ -34,10 +35,14 @@ class Run:
     latex: Optional[str] = None
     # citation marker produced by the citation engine
     cite: bool = False
+    # verbatim source run (e.g. MathType / Equation Editor OLE object) + its preview image (blob, ext)
+    raw: Any = None
+    img: Any = None
 
     @property
     def is_math(self) -> bool:
-        return self.omml is not None or self.latex is not None
+        return self.omml is not None or self.latex is not None or self.raw is not None or \
+            (self.img is not None and not self.text)
 
 
 @dataclass
@@ -51,6 +56,7 @@ class Block:
     image: Optional[bytes] = None        # figure
     image_ext: str = "png"
     width_in: Optional[float] = None
+    height_in: Optional[float] = None
     cap_kind: str = ""                   # caption: 'figure' | 'table'
     cap_num: Optional[int] = None
     label: str = ""                      # e.g. abstract sub-heading "Purpose"
@@ -62,6 +68,10 @@ class Block:
     src_font: str = ""
     src_bold: bool = False
     prefix: str = ""                     # generated numbering/label text (heading no., caption label)
+    raw: Optional[list] = None           # verbatim source XML elements (equations, algorithms, complex tables)
+    lines: Optional[list] = None         # algorithm lines: [(indent_level, [Run])]
+    rows_runs: Optional[list] = None     # table cells as runs (keeps inline maths/formatting)
+    tex_src: str = ""                    # original LaTeX source (algorithms from .tex input)
 
     @property
     def text(self) -> str:
@@ -76,6 +86,8 @@ class Document:
     blocks: List[Block] = field(default_factory=list)
     source_type: str = ""
     warnings: List[str] = field(default_factory=list)
+    src_docx: Any = None                 # python-docx Document the blocks were read from (for raw XML parts)
+    tex_preamble: List[str] = field(default_factory=list)  # \\usepackage lines needed by verbatim LaTeX blocks
 
     def by_role(self, role):
         return [b for b in self.blocks if b.role == role]

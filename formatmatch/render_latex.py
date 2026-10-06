@@ -77,6 +77,40 @@ def omml_to_latex(omml_list: List[str]) -> Dict[int, str]:
     return out
 
 
+_IMG_CACHE: Dict[int, tuple] = {}
+
+
+def to_web_image(blob: bytes, ext: str):
+    """Return (bytes, ext) usable by pdflatex: PNG/JPG/PDF as-is, everything else (WMF/EMF/TIFF…) → PNG."""
+    ext = (ext or "png").lower()
+    if ext in ("png", "jpg", "jpeg", "pdf"):
+        return blob, ext
+    key = hash(blob)
+    if key in _IMG_CACHE:
+        return _IMG_CACHE[key]
+    out = None
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(blob))
+        b = io.BytesIO(); im.convert("RGB").save(b, "PNG"); out = (b.getvalue(), "png")
+    except Exception:
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if soffice:
+            with tempfile.TemporaryDirectory() as td:
+                src = os.path.join(td, f"img.{ext}")
+                open(src, "wb").write(blob)
+                try:
+                    subprocess.run([soffice, "--headless", "--convert-to", "png", "--outdir", td, src],
+                                   capture_output=True, timeout=120)
+                    png = os.path.join(td, "img.png")
+                    if os.path.exists(png):
+                        out = (open(png, "rb").read(), "png")
+                except Exception:
+                    pass
+    _IMG_CACHE[key] = out
+    return out
+
+
 class LatexRenderer:
     def __init__(self, spec: dict, refs=None):
         self.spec = spec
@@ -85,14 +119,47 @@ class LatexRenderer:
         self.math: Dict[int, str] = {}
         self.math_ids: Dict[int, int] = {}
         self.cls = spec["latex"].get("class", "article")
+        self.need_algo = False
+        self.extra_preamble: List[str] = []
+        self.warnings: List[str] = []
+        self.eqimg = 0
+
+    # ---------------------------------------------------------- maths
+    def _eq_image(self, r: Run):
+        info = r.img or {}
+        conv = to_web_image(info.get("blob"), info.get("ext")) if info.get("blob") else None
+        if not conv:
+            self.warnings.append("A MathType/OLE equation had no usable preview image; re-type it in the LaTeX file.")
+            return None, None
+        self.eqimg += 1
+        name = f"equations/eq{self.eqimg}.{conv[1]}"
+        self.files[name] = conv[0]
+        h_pt = max(6.0, (info.get("h") or 0.18) * 72)
+        return name, h_pt
+
+    def math_tex(self, r: Run, in_math: bool) -> str:
+        """LaTeX for one maths run; in_math=True when already inside a maths environment."""
+        if r.raw is not None or (r.img is not None and r.omml is None and r.latex is None):
+            name, h = self._eq_image(r)
+            if not name:
+                return "\\square" if in_math else "\\(\\square\\)"
+            g = f"\\includegraphics[height={h:.1f}pt]{{{name}}}"
+            if not hasattr(self, "_warned_mt"):
+                self._warned_mt = True
+                self.warnings.append("MathType / Equation Editor objects are exported to LaTeX as images "
+                                     "(they stay fully editable in the Word output).")
+            return f"\\vcenter{{\\hbox{{{g}}}}}" if in_math else f"\\raisebox{{-0.3\\height}}{{{g}}}"
+        lx = r.latex or self.math.get(self.math_ids.get(id(r), -1))
+        if not lx:
+            return "\\square" if in_math else "\\(\\square\\)"
+        return lx if in_math else f"\\({lx}\\)"
 
     # ---------------------------------------------------------- inline text
     def runs(self, runs: List[Run]) -> str:
         out = []
         for r in runs:
             if r.is_math:
-                lx = r.latex or self.math.get(self.math_ids.get(id(r), -1))
-                out.append(f"\\({lx}\\)" if lx else "\\(\\square\\)")
+                out.append(self.math_tex(r, in_math=False))
                 continue
             if r.cite and self.mode_numeric:
                 nums = re.findall(r"\d+(?:\s*[–-]\s*\d+)?", r.text)
@@ -166,6 +233,11 @@ class LatexRenderer:
         if cls == "sn-jnl":
             pk = [x for x in pk if "inputenc" not in x and "fontenc" not in x]
         L += pk
+        extra = [x for x in self.extra_preamble if x not in L]
+        uses_alg2e = any("algorithm2e" in x for x in extra)
+        if self.need_algo and not uses_alg2e:
+            L += ["\\usepackage{algorithm}", "\\usepackage{algpseudocode}"]
+        L += extra
         if cls == "IEEEtran":
             L.append("\\hyphenation{op-tical net-works semi-conduc-tor}")
         L.append("\\begin{document}")
@@ -274,12 +346,23 @@ class LatexRenderer:
                     i += 1
                 L.append(f"\\end{{{env}}}")
                 continue
+            elif r == M.EQUATION and b.tex_src:
+                L.append(b.tex_src)                     # LaTeX input: original environment, untouched
             elif r == M.EQUATION:
-                body = " ".join((self.math.get(self.math_ids.get(id(x), -1)) or x.latex or "") for x in b.runs if x.is_math)
-                if b.eq_num:
-                    L.append(f"\\begin{{equation}}\n{body}\n\\label{{eq:{b.eq_num}}}\n\\end{{equation}}")
+                if b.image and not b.runs:
+                    b = M.Block(M.EQUATION, eq_num=b.eq_num, runs=[Run(img={"blob": b.image, "ext": b.image_ext,
+                                                                            "h": b.height_in or 0.3})])
+                parts = [self.math_tex(x, in_math=True) for x in b.runs if x.is_math]
+                tag = f"\\tag{{{b.eq_num}}}\\label{{eq:{b.eq_num}}}" if b.eq_num else ""
+                if len(parts) <= 1:
+                    body = parts[0] if parts else ""
+                    L.append(f"\\begin{{equation}}\n{body}{tag}\n\\end{{equation}}" if b.eq_num
+                             else f"\\[\n{body}\n\\]")
                 else:
-                    L.append(f"\\[\n{body}\n\\]")
+                    rows = [p + " \\notag" for p in parts[:-1]] + [parts[-1] + (tag if b.eq_num else " \\notag")]
+                    L.append("\\begin{gather}\n" + " \\\\\n".join(rows) + "\n\\end{gather}")
+            elif r == M.ALGORITHM:
+                L.append(self.algorithm(b))
             elif r in (M.FIGURE, M.CAPTION, M.TABLE):
                 # gather a float group: caption + float(s) in any order
                 grp = []
@@ -322,8 +405,24 @@ class LatexRenderer:
             colspec = "l" + "c" * (ncol - 1)
             body = [f"\\begin{{tabular}}{{{colspec}}}", "\\toprule"]
             for k, row in enumerate(t.rows):
-                cells = [esc(c) for c in row] + [""] * (ncol - len(row))
-                if k == 0:
+                rr = t.rows_runs[k] if t.rows_runs and k < len(t.rows_runs) else None
+                if rr:
+                    cells = []
+                    for ci, c in enumerate(rr[:ncol]):
+                        if c is None:
+                            continue                       # covered by \\multicolumn
+                        span = 1
+                        while ci + span < len(rr) and rr[ci + span] is None:
+                            span += 1
+                        txt = self.runs(c) if c else ""
+                        if k == 0 and txt:
+                            txt = f"\\textbf{{{txt}}}"
+                        cells.append(f"\\multicolumn{{{span}}}{{c}}{{{txt}}}" if span > 1 else txt)
+                    used = sum(1 for c in rr[:ncol])
+                    cells += [""] * (ncol - used)
+                else:
+                    cells = [esc(c) for c in row] + [""] * (ncol - len(row))
+                if k == 0 and not rr:
                     cells = [f"\\textbf{{{c}}}" if c else c for c in cells]
                 body.append(" & ".join(cells) + " \\\\")
                 if k == 0:
@@ -337,6 +436,44 @@ class LatexRenderer:
         if cap is not None and not figs and not tabs:
             out.append(f"% Orphan caption: {cap_tex}")
         return out
+
+    def algorithm(self, b: M.Block) -> str:
+        if b.tex_src:
+            return b.tex_src                         # LaTeX input: original environment, untouched
+        from .algo import ALGO_HEAD_RE, LINENO_RE
+        self.need_algo = True
+        title_runs = list(b.runs)
+        m = ALGO_HEAD_RE.match(b.orig or "")
+        if m and title_runs:
+            from .runs_util import trim_leading
+            rest = m.group("rest").strip()
+            title_runs = trim_leading(title_runs, rest) if rest else []
+        title_runs = [Run(x.text, False, x.italic, x.sup, x.sub, x.omml, x.latex, raw=x.raw, img=x.img)
+                      if not x.is_math else x for x in title_runs]
+        caption = self.runs(title_runs) if title_runs else ""
+        lines = b.lines or []
+        texts = ["".join(x.text for x in rs if not x.is_math) for _, rs in lines]
+        numbered = b.ordered or (lines and sum(bool(LINENO_RE.match(t)) for t in texts) >= max(1, len(lines) // 2))
+        out = ["\\begin{algorithm}[!t]", f"\\caption{{{caption}}}" if caption else "\\caption{}",
+               "\\begin{algorithmic}" + ("[1]" if numbered else "")]
+        base = min((lvl for lvl, _ in lines), default=0)
+        for (lvl, rs), t in zip(lines, texts):
+            rs = list(rs)
+            if rs and not rs[0].is_math and LINENO_RE.match(rs[0].text):
+                rs[0] = Run(LINENO_RE.sub("", rs[0].text, count=1), rs[0].bold, rs[0].italic)
+            kw = re.match(r"^\s*(input|inputs|require|requires|output|outputs|ensure|ensures)\s*[:.]?\s*", t, re.I)
+            if kw:
+                from .runs_util import trim_leading
+                rest = t[kw.end():]
+                body = self.runs(trim_leading(rs, rest)) if rest.strip() else ""
+                cmd = "\\Require" if kw.group(1).lower().startswith(("in", "req")) else "\\Ensure"
+                out.append(f"{cmd} {body}")
+                continue
+            ind = lvl - base
+            pad = f"\\hspace*{{{ind:.1f}em}}" if ind > 0.05 else ""
+            out.append(f"\\State {pad}{self.runs(rs)}")
+        out += ["\\end{algorithmic}", "\\end{algorithm}"]
+        return "\n".join(out)
 
     def add_image(self, f: M.Block):
         ext = (f.image_ext or "png").lower()
@@ -393,19 +530,30 @@ class LatexRenderer:
     # ---------------------------------------------------------- main
     def render(self, doc: M.Document) -> bytes:
         maths = []
-        for b in doc.blocks:
-            for r in b.runs:
+
+        def collect(rs):
+            for r in rs or []:
                 if r.omml:
                     self.math_ids[id(r)] = len(maths)
                     maths.append(r.omml)
+        for b in doc.blocks:
+            collect(b.runs)
+            for _, rs in (b.lines or []):
+                collect(rs)
+            for row in (b.rows_runs or []):
+                for cell in row:
+                    collect(cell)
         self.math = omml_to_latex(maths)
         front = {"title": doc.first(M.TITLE), "authors": doc.by_role(M.AUTHOR), "affils": doc.by_role(M.AFFIL),
                  "abstract": doc.by_role(M.ABSTRACT), "keywords": doc.first(M.KEYWORDS)}
         front_roles = {M.TITLE, M.AUTHOR, M.AFFIL, M.ABSTRACT, M.KEYWORDS, M.OTHER_FRONT}
         body_blocks = [b for b in doc.blocks if b.role not in front_roles and b.role != M.REFERENCE]
         refs = doc.by_role(M.REFERENCE)
-        tex = [self.preamble(front), self.front_matter(front), self.body(body_blocks), "", self.bibliography(refs),
-               "", "\\end{document}", ""]
+        self.extra_preamble = list(doc.tex_preamble)
+        fm = self.front_matter(front)
+        body = self.body(body_blocks)
+        bib = self.bibliography(refs)
+        tex = [self.preamble(front), fm, body, "", bib, "", "\\end{document}", ""]
         main = "\n".join(tex)
         self.files["main.tex"] = main.encode("utf-8")
         if self.refs:
@@ -430,8 +578,12 @@ class LatexRenderer:
         return buf.getvalue()
 
 
-def render_latex(doc: M.Document, spec: dict, refs=None) -> bytes:
-    return LatexRenderer(spec, refs).render(doc)
+def render_latex(doc: M.Document, spec: dict, refs=None, warnings: list = None) -> bytes:
+    r = LatexRenderer(spec, refs)
+    data = r.render(doc)
+    if warnings is not None:
+        warnings.extend(dict.fromkeys(r.warnings))
+    return data
 
 
 def try_compile(zip_bytes: bytes, fallback_class: bool = True):

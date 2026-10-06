@@ -76,7 +76,17 @@ def read_any(filename: str, data: bytes) -> M.Document:
             else:
                 main = os.path.join(td, "main." + ("markdown" if ext in ("md", "txt") else "tex"))
                 open(main, "wb").write(data)
+            protected, prem = [], []
+            if main.endswith(".tex"):
+                from .texblocks import expand_inputs, protect
+                src = open(main, encoding="utf-8", errors="ignore").read()
+                src = expand_inputs(src, os.path.dirname(main))
+                mod, protected, prem = protect(src)
+                open(main, "w", encoding="utf-8").write(mod)
             doc = read_docx(io.BytesIO(_pandoc_to_docx(td, main)))
+            if protected:
+                from .texblocks import restore
+                restore(doc, protected, prem)
         doc.source_type = ext
         if ext in ("tex", "zip"):
             doc.warnings.append("LaTeX input converted via pandoc — custom macros/environments may need a check.")

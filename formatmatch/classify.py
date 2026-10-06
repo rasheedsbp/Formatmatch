@@ -127,6 +127,10 @@ def looks_like_heading(text: str, bold: bool, size: float, body_size: float, sty
         return 0
     level, bare = strip_heading_number(t)
     words = len(bare.split())
+    # pseudo-code / step lines ("1. Initialize population", "2. x ← x + 1") are not headings
+    from .algo import CODEISH_RE, STEP_RE
+    if STEP_RE.match(bare) and not known_section(t) or CODEISH_RE.search(bare) or re.search(r"[=←∑∈≤≥]", bare):
+        return 0
     ends_sentence = bare.endswith((".", ",", ";")) and not bare.endswith("etc.")
     ks = known_section(t)
     if ks and words <= 8:

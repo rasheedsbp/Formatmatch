@@ -141,7 +141,10 @@ def format_manuscript(filename: str, data: bytes, spec: dict, profile=None, want
             rep.warn(x)
     if want_latex:
         prog(0.8, "Writing LaTeX project")
-        latex_bytes = render_latex(prepared, spec, rep.refs)
+        lw = []
+        latex_bytes = render_latex(prepared, spec, rep.refs, lw)
+        for x in lw:
+            rep.warn(x)
     pdf = None
     if preview and docx_bytes:
         prog(0.9, "Rendering preview")
