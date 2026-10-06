@@ -1,5 +1,6 @@
 """Create realistic test manuscripts (APA-style Word draft) for end-to-end tests."""
 import copy
+import sys
 import io
 import os
 
@@ -124,3 +125,118 @@ if __name__ == "__main__":
     make_apa_draft(os.path.join(HERE, "draft_apa.docx"))
     make_template(os.path.join(HERE, "template_journal.docx"))
     print("ok")
+
+
+def make_math_algo(path):
+    """Manuscript with MathType OLE equations, equation tables, OMML, algorithms (paragraphs + table), complex table."""
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+    from docx.oxml import parse_xml
+    from docx.shared import Inches as In
+    from PIL import Image, ImageDraw
+
+    d = docx.Document()
+    st = d.styles["Normal"]; st.font.name = "Times New Roman"; st.font.size = Pt(12)
+    part = d.part
+
+    def eq_png(text, w=300, h=40):
+        im = Image.new("RGB", (w, h), "white"); dr = ImageDraw.Draw(im); dr.text((5, 12), text, fill="black")
+        b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
+
+    counter = [0]
+
+    def ole_run(text, w_pt=150, h_pt=20):
+        counter[0] += 1
+        img = Part(PackURI(f"/word/media/mt{counter[0]}.png"), "image/png", eq_png(text), part.package)
+        rid_img = part.relate_to(img, RT.IMAGE)
+        ole = Part(PackURI(f"/word/embeddings/oleObject{counter[0]}.bin"), "application/vnd.openxmlformats-officedocument.oleObject",
+                   b"\xd0\xcf\x11\xe0FAKE-MATHTYPE" + text.encode(), part.package)
+        rid_ole = part.relate_to(ole, RT.OLE_OBJECT)
+        xml = (f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+               f'xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" '
+               f'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+               f'<w:rPr><w:position w:val="-10"/></w:rPr>'
+               f'<w:object w:dxaOrig="{int(w_pt*20)}" w:dyaOrig="{int(h_pt*20)}">'
+               f'<v:shape id="_x0000_i10{counter[0]}" type="#_x0000_t75" style="width:{w_pt}pt;height:{h_pt}pt" o:ole="">'
+               f'<v:imagedata r:id="{rid_img}" o:title=""/></v:shape>'
+               f'<o:OLEObject Type="Embed" ProgID="Equation.DSMT4" ShapeID="_x0000_i10{counter[0]}" DrawAspect="Content" '
+               f'ObjectID="_14{counter[0]}" r:id="{rid_ole}"/></w:object></w:r>')
+        return parse_xml(xml)
+
+    eqd = docx.Document(os.path.join(HERE, "eq.docx"))
+    omml_para = eqd.paragraphs[0]._p
+    omml = next(omml_para.iter("{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath"))
+    inline_omml = next(eqd.paragraphs[1]._p.iter("{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath"))
+
+    p = d.add_paragraph(); r = p.add_run("Energy-Aware Task Scheduling Using Particle Swarm Optimisation"); r.bold = True; r.font.size = Pt(16)
+    d.add_paragraph("A. Author, B. Author")
+    d.add_paragraph("Department of CSE, Some University, India")
+    d.add_paragraph("Abstract: We schedule tasks with PSO and report the energy model used in fog nodes.")
+    d.add_paragraph("Keywords: fog computing; PSO; scheduling")
+    h = d.add_paragraph(); h.add_run("1. Introduction").bold = True
+    p = d.add_paragraph("The energy of node j is ")
+    p._p.append(ole_run("E_j = P_j t_j", 60, 14))
+    p.add_run(" and the inline OMML term ")
+    p._p.append(copy.deepcopy(inline_omml))
+    p.add_run(" appears inside the sentence [1].")
+    h = d.add_paragraph(); h.add_run("2. System Model").bold = True
+    d.add_paragraph("The total energy is given by Eq. (1), using MathType:")
+    # MathType display equation with tabs (MTDisplayEquation style)
+    p = d.add_paragraph()
+    pf = p.paragraph_format
+    from docx.enum.text import WD_TAB_ALIGNMENT
+    pf.tab_stops.add_tab_stop(In(3.25), WD_TAB_ALIGNMENT.CENTER)
+    pf.tab_stops.add_tab_stop(In(6.5), WD_TAB_ALIGNMENT.RIGHT)
+    p.add_run().add_tab()
+    p._p.append(ole_run("E = sum_j P_j t_j + E_idle"))
+    p.add_run().add_tab()
+    p.add_run("(1)")
+    d.add_paragraph("The delay constraint is written in an equation table:")
+    t = d.add_table(rows=1, cols=3)
+    t.cell(0, 0).width = In(0.6); t.cell(0, 1).width = In(5.0); t.cell(0, 2).width = In(0.9)
+    t.cell(0, 1).paragraphs[0]._p.append(copy.deepcopy(omml))
+    t.cell(0, 2).paragraphs[0].add_run("(2)")
+    d.add_paragraph("A plain OMML numbered equation follows.")
+    p = d.add_paragraph(); p.add_run().add_tab(); p._p.append(copy.deepcopy(omml)); p.add_run().add_tab(); p.add_run("(3)")
+    h = d.add_paragraph(); h.add_run("3. Proposed Method").bold = True
+    d.add_paragraph("Algorithm 1 summarises the proposed scheduler, whose update rule uses the velocity term.")
+    p = d.add_paragraph(); p.add_run("Algorithm 1: ").bold = True; p.add_run("PSO-based task scheduling")
+    lines = [(0, "Input: tasks T, fog nodes F, swarm size N"), (0, "Output: best schedule g"),
+             (0, "1: Initialize N particles randomly"), (0, "2: for t = 1 to Tmax do"),
+             (1, "3: for each particle i do"), (2, "4: v ← w·v + c1·r1·(p − x)"), (2, "5: x ← x + v"),
+             (1, "6: end for"), (0, "7: end for"), (0, "8: return g")]
+    for lvl, txt in lines:
+        q = d.add_paragraph()
+        q.paragraph_format.left_indent = In(0.3 * lvl)
+        q.paragraph_format.space_after = Pt(0)
+        if lvl == 2 and "v ←" in txt:
+            q.add_run("4: v ← ")
+            q._p.append(copy.deepcopy(inline_omml))
+        else:
+            q.add_run(txt)
+    d.add_paragraph("After convergence the best particle is mapped to the fog nodes, as discussed in the following "
+                    "section where we also compare it with the genetic algorithm baseline in detail for completeness.")
+    # Algorithm in a one-cell table with Word auto-numbered lines
+    t = d.add_table(rows=1, cols=1); t.style = "Table Grid"
+    c = t.cell(0, 0)
+    c.paragraphs[0].add_run("Algorithm 2: Genetic algorithm baseline").bold = True
+    for txt in ["Generate initial population P", "Evaluate fitness of each chromosome", "Apply crossover and mutation",
+                "Return the fittest chromosome"]:
+        c.add_paragraph(txt, style="List Number")
+    h = d.add_paragraph(); h.add_run("4. Results").bold = True
+    d.add_paragraph("Table 1 lists the energy per method with merged headers and a maths cell.")
+    d.add_paragraph("Table 1. Energy comparison")
+    t = d.add_table(rows=3, cols=3); t.style = "Table Grid"
+    a = t.cell(0, 1).merge(t.cell(0, 2)); a.text = "Energy (J)"
+    t.cell(0, 0).text = "Method"
+    t.cell(1, 0).text = ""; t.cell(1, 1).text = "Mean"; t.cell(1, 2).text = "Std"
+    t.cell(2, 0).text = "PSO"; t.cell(2, 1).paragraphs[0]._p.append(copy.deepcopy(inline_omml)); t.cell(2, 2).text = "0.4"
+    h = d.add_paragraph(); h.add_run("References").bold = True
+    d.add_paragraph("[1] A. Smith, “Fog scheduling,” IEEE Access, vol. 9, pp. 1–10, 2021.")
+    d.save(path)
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "math":
+    make_math_algo(os.path.join(HERE, "math_algo.docx"))
+    print("math ok")
